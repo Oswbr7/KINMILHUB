@@ -13,6 +13,10 @@ using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using File = System.IO.File;
+using Amazon;
+using Amazon.S3;
+using Amazon.S3.Model;
+using System.Threading.Tasks;
 
 namespace GAMEHUB_V3
 {
@@ -22,6 +26,7 @@ namespace GAMEHUB_V3
         private ObservableCollection<GameLink> AllLinks { get; set; } = new(); // <- lista completa
         private Config config;
         private FileSystemWatcher watcher;
+        private S3Service s3Service;
 
         //private string cacheFile = "cache.txt";
         //private string imageCacheFolder = "cache_images";
@@ -34,6 +39,7 @@ namespace GAMEHUB_V3
             InitializeComponent();
             GameList.ItemsSource = Links;
             config = Config.Load();
+            s3Service = new S3Service(config);
 
             // Crear carpetas si no existen
             AppPaths.EnsureDirectories();
@@ -48,6 +54,52 @@ namespace GAMEHUB_V3
                         await LoadInks(lastPath);
                 }
             };
+        }
+
+        public class S3Service
+        {
+            private readonly string bucketName;
+            private readonly IAmazonS3 s3Client;
+
+            public S3Service(Config config)
+            {
+                var region = RegionEndpoint.GetBySystemName(config.AwsRegion);
+                s3Client = new AmazonS3Client(config.AwsAccessKey, config.AwsSecretKey, region);
+                bucketName = config.AwsBucketName;
+            }
+
+            // 📤 Subir imagen a S3
+            public async Task<string> UploadImageAsync(string localPath, string fileName)
+            {
+                using var stream = new FileStream(localPath, FileMode.Open, FileAccess.Read);
+
+                var request = new PutObjectRequest
+                {
+                    BucketName = bucketName,
+                    Key = $"images/{fileName}",
+                    InputStream = stream,
+                    ContentType = "image/jpeg",
+                    CannedACL = S3CannedACL.PublicRead // 🔓 URL pública
+                };
+
+                await s3Client.PutObjectAsync(request);
+
+                return $"https://{bucketName}.s3.amazonaws.com/images/{fileName}";
+            }
+
+            // 📥 Descargar imagen desde S3 (opcional)
+            public async Task DownloadImageAsync(string key, string savePath)
+            {
+                var response = await s3Client.GetObjectAsync(bucketName, key);
+                await using var responseStream = response.ResponseStream;
+                await using var fileStream = new FileStream(savePath, FileMode.Create, FileAccess.Write);
+                await responseStream.CopyToAsync(fileStream);
+            }
+
+            public async Task UploadImageAsyncFromStream(PutObjectRequest request)
+            {
+                await s3Client.PutObjectAsync(request);
+            }
         }
 
         private async Task LoadInks(string folderPath)
@@ -336,6 +388,7 @@ namespace GAMEHUB_V3
 
                 string query = Uri.EscapeDataString(gameName + " game cover");
                 string url = $"https://www.googleapis.com/customsearch/v1?q={query}&cx={config.SearchEngineId}&key={config.GoogleApiKey}&searchType=image&num=1";
+                string fileName = Path.GetFileName(savePath);
 
                 var response = await client.GetAsync(url);
                 if (!response.IsSuccessStatusCode)
@@ -361,8 +414,32 @@ namespace GAMEHUB_V3
                     g.DrawImage(original, 0, 0, 1024, 1024);
                 }
 
-                resized.Save(savePath, System.Drawing.Imaging.ImageFormat.Jpeg);
-                //await File.WriteAllBytesAsync(savePath, imageData);
+                //resized.Save(savePath, System.Drawing.Imaging.ImageFormat.Jpeg);
+                ////await File.WriteAllBytesAsync(savePath, imageData);
+                //string s3Url = await s3Service.UploadImageAsync(savePath, fileName);
+                //Console.WriteLine($"Imagen subida a S3: {s3Url}");
+                using var outputStream = new MemoryStream();
+                resized.Save(outputStream, System.Drawing.Imaging.ImageFormat.Jpeg);
+                outputStream.Position = 0;
+
+                var putRequest = new Amazon.S3.Model.PutObjectRequest
+                {
+                    BucketName = config.AwsBucketName,
+                    Key = $"images/{fileName}",
+                    InputStream = outputStream,
+                    ContentType = "image/jpeg",
+                    CannedACL = S3CannedACL.PublicRead
+                };
+
+                await s3Service.UploadImageAsyncFromStream(putRequest);
+
+                // ✅ Actualizar el ImagePath con la URL pública en S3
+                string s3Url = $"https://{config.AwsBucketName}.s3.amazonaws.com/images/{fileName}";
+                var game = Links.FirstOrDefault(g => g.Name.Equals(gameName, StringComparison.OrdinalIgnoreCase));
+                if (game != null)
+                    game.ImagePath = s3Url;
+
+                Console.WriteLine($"✅ Imagen subida a S3: {s3Url}");
             }
             catch (Exception ex)
             {
@@ -424,6 +501,10 @@ namespace GAMEHUB_V3
     {
         public string GoogleApiKey { get; set; }
         public string SearchEngineId { get; set; }
+        public string AwsAccessKey { get; set; }
+        public string AwsSecretKey { get; set; }
+        public string AwsBucketName { get; set; }
+        public string AwsRegion { get; set; }
 
         public static Config Load()
         {
@@ -437,7 +518,11 @@ namespace GAMEHUB_V3
                 var defaultConfig = new Config
                 {
                     GoogleApiKey = "",
-                    SearchEngineId = ""
+                    SearchEngineId = "",
+                    AwsAccessKey = "",
+                    AwsSecretKey = "",
+                    AwsBucketName = "",
+                    AwsRegion = ""
                 };
                 string json = JsonSerializer.Serialize(defaultConfig, new JsonSerializerOptions { WriteIndented = true });
                 Directory.CreateDirectory(AppPaths.BasePath);
